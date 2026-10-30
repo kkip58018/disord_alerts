@@ -3,7 +3,7 @@ import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-import turso.aio  # Async Turso driver[reference:7]
+import turso_serverless
 from biquote import Biquote
 
 # --- Configuration ---
@@ -16,13 +16,19 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# --- Turso Database Helper ---
-async def get_db():
-    return await turso.aio.connect(TURSO_DB_URL, auth_token=TURSO_AUTH_TOKEN)
+# --- Turso Database Helpers (Synchronous, wrapped in threads) ---
+def _connect():
+    """Create a new synchronous Turso connection."""
+    return turso_serverless.connect(
+        TURSO_DB_URL,
+        auth_token=TURSO_AUTH_TOKEN,
+    )
 
-async def init_db():
-    async with await get_db() as db:
-        await db.execute("""
+def _init_db_sync():
+    """Synchronous DB initialization."""
+    conn = _connect()
+    try:
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
@@ -32,70 +38,102 @@ async def init_db():
                 triggered INTEGER DEFAULT 0
             )
         """)
-        await db.commit()
+        conn.commit()
+    finally:
+        conn.close()
+
+async def init_db():
+    await asyncio.to_thread(_init_db_sync)
+
+def _insert_alert_sync(user_id: str, pair: str, price: float, direction: str):
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO alerts (user_id, pair, target_price, direction) VALUES (?, ?, ?, ?)",
+            (user_id, pair, price, direction),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+async def insert_alert(user_id: str, pair: str, price: float, direction: str):
+    await asyncio.to_thread(_insert_alert_sync, user_id, pair, price, direction)
+
+def _fetch_active_alerts_sync():
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            "SELECT id, user_id, pair, target_price, direction FROM alerts WHERE triggered = 0"
+        )
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+async def fetch_active_alerts():
+    return await asyncio.to_thread(_fetch_active_alerts_sync)
+
+def _mark_triggered_sync(alert_id: int):
+    conn = _connect()
+    try:
+        conn.execute("UPDATE alerts SET triggered = 1 WHERE id = ?", (alert_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+async def mark_triggered(alert_id: int):
+    await asyncio.to_thread(_mark_triggered_sync, alert_id)
 
 # --- Slash Command: /alert ---
 @tree.command(name="alert", description="Set a price alert for a forex pair")
 @app_commands.describe(
     pair="Currency pair (e.g., EURUSD)",
     price="The target price",
-    direction="Alert when price goes 'above' or 'below' the target"
+    direction="Alert when price goes 'above' or 'below' the target",
 )
 @app_commands.choices(direction=[
     app_commands.Choice(name="Above", value="above"),
     app_commands.Choice(name="Below", value="below"),
 ])
 async def alert(interaction: discord.Interaction, pair: str, price: float, direction: str):
-    await interaction.response.defer(ephemeral=True) # Acknowledge the command
+    await interaction.response.defer(ephemeral=True)
 
     pair = pair.upper()
-    async with await get_db() as db:
-        await db.execute(
-            "INSERT INTO alerts (user_id, pair, target_price, direction) VALUES (?, ?, ?, ?)",
-            (str(interaction.user.id), pair, price, direction)
-        )
-        await db.commit()
+    await insert_alert(str(interaction.user.id), pair, price, direction)
 
     await interaction.followup.send(
         f"✅ Alert set for **{pair}** {direction} **{price:.4f}**.",
-        ephemeral=True
+        ephemeral=True,
     )
 
 # --- Background Task: Check Prices ---
-@tasks.loop(minutes=5) # Adjust frequency as needed
+@tasks.loop(minutes=5)
 async def check_prices():
     bq = Biquote()
     try:
-        async with await get_db() as db:
-            # Fetch all active (non-triggered) alerts
-            cursor = await db.execute("SELECT id, user_id, pair, target_price, direction FROM alerts WHERE triggered = 0")
-            active_alerts = await cursor.fetchall()
+        active_alerts = await fetch_active_alerts()
 
-            for alert_id, user_id, pair, target_price, direction in active_alerts:
-                try:
-                    tick = bq.tick(pair) # Fetch real-time price[reference:8]
-                    current_price = tick["mid"]
+        for alert_id, user_id, pair, target_price, direction in active_alerts:
+            try:
+                tick = bq.tick(pair)
+                current_price = tick["mid"]
 
-                    should_trigger = (
-                        (direction == "above" and current_price >= target_price) or
-                        (direction == "below" and current_price <= target_price)
-                    )
+                should_trigger = (
+                    (direction == "above" and current_price >= target_price)
+                    or (direction == "below" and current_price <= target_price)
+                )
 
-                    if should_trigger:
-                        # Mark as triggered in DB
-                        await db.execute("UPDATE alerts SET triggered = 1 WHERE id = ?", (alert_id,))
-                        await db.commit()
+                if should_trigger:
+                    await mark_triggered(alert_id)
 
-                        # Send DM to the user
-                        user = await bot.fetch_user(int(user_id))
-                        if user:
-                            await user.send(
-                                f"🔔 **Alert Triggered!**\n"
-                                f"**{pair}** is now at **{current_price:.4f}** "
-                                f"({direction} your target of {target_price:.4f})."
-                            )
-                except Exception as e:
-                    print(f"Error checking {pair} for alert {alert_id}: {e}")
+                    user = await bot.fetch_user(int(user_id))
+                    if user:
+                        await user.send(
+                            f"🔔 **Alert Triggered!**\n"
+                            f"**{pair}** is now at **{current_price:.4f}** "
+                            f"({direction} your target of {target_price:.4f})."
+                        )
+            except Exception as e:
+                print(f"Error checking {pair} for alert {alert_id}: {e}")
     except Exception as e:
         print(f"Error in check_prices task: {e}")
 
@@ -104,15 +142,10 @@ async def check_prices():
 async def on_ready():
     print(f"Logged in as {bot.user}")
     await init_db()
-    await tree.sync() # Sync slash commands with Discord[reference:9]
+    await tree.sync()
     if not check_prices.is_running():
         check_prices.start()
 
-# --- Entry Point (for StayPresent) ---
-# The actual bot.run() is placed in a separate file to be wrapped by StayPresent.
-# However, for simplicity, we can let StayPresent run this script directly if we
-# structure the entry point correctly in main.py.
+# --- Local entry point (Render will use main.py + StayPresent) ---
 if __name__ == "__main__":
-    # When running locally for testing, you can use bot.run(DISCORD_TOKEN)
-    # On Render, StayPresent will handle starting the process.
-    pass
+    bot.run(DISCORD_TOKEN)

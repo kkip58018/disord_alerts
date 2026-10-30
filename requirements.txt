@@ -1,4 +1,4 @@
 discord.py
-turso.aio
+turso-serverless
 biquote
 staypresent[prod]
