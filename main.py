@@ -7,7 +7,7 @@ staypresent.web.json({"status": "running", "service": "eurusd-alert-bot"})
 # Self-ping to prevent the free tier from sleeping every 4 minutes[reference:10]
 # IMPORTANT: Replace with your actual Render URL after the first deploy.
 staypresent.cron(
-    "https://your-app-name.onrender.com",
+    "https://disord-bot-alerts.onrender.com",
     interval=240,
 )
 
